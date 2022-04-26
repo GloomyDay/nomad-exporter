@@ -14,6 +14,7 @@ import (
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
 )
 
@@ -51,6 +52,11 @@ var (
 		prometheus.BuildFQName(namespace, "", "allocations"),
 		"How many allocations are there in the cluster.",
 		nil, nil,
+	)
+	notSuccessfuldeployments = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "deployments"),
+		"All current non successful deployments ",
+		[]string{"job", "deployment_id", "status"}, nil,
 	)
 	allocationMemory = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "allocation_memory"),
@@ -92,6 +98,11 @@ var (
 		"Task memory RSS usage, bytes",
 		[]string{"job", "group", "alloc", "alloc_id", "task", "region", "datacenter", "node"}, nil,
 	)
+	taskMemoryLimit = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "task_memory_limit"),
+		"Task memory limit, Megabytes",
+		[]string{"job", "group", "alloc", "alloc_id", "task", "region", "datacenter", "node"}, nil,
+	)
 	nodeResourceMemory = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "node_resource_memory_megabytes"),
 		"Amount of allocatable memory the node has in MB",
@@ -129,6 +140,14 @@ var (
 	)
 )
 
+func getIntPointer(val *int) int {
+	return *val
+}
+
+func getStringPointer(val *string) string {
+	return *val
+}
+
 func AllocationsByStatus(allocs []*api.AllocationListStub, status string) []*api.AllocationListStub {
 	var resp []*api.AllocationListStub
 	for _, a := range allocs {
@@ -159,6 +178,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- clusterServers
 	ch <- nodeCount
 	ch <- nodeStatus
+	ch <- notSuccessfuldeployments
 	ch <- allocationCount
 	ch <- jobCount
 	ch <- allocationMemory
@@ -169,6 +189,7 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- taskCPUPercent
 	ch <- taskCPUTotalTicks
 	ch <- taskMemoryRssBytes
+	ch <- taskMemoryLimit
 	ch <- nodeResourceMemory
 	ch <- nodeAllocatedMemory
 	ch <- nodeUsedMemory
@@ -226,6 +247,18 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	deployments, _, err := e.client.Deployments().List(&api.QueryOptions{})
+	if err != nil {
+		logError(err)
+		return
+	}
+	for _, deployment := range deployments {
+		if deployment.Status != "successful" {
+			ch <- prometheus.MustNewConstMetric(
+				notSuccessfuldeployments, prometheus.GaugeValue, float64(1), deployment.JobID, deployment.ID, deployment.Status,
+			)
+		}
+	}
 	runningAllocs := AllocationsByStatus(allocs, "running")
 
 	ch <- prometheus.MustNewConstMetric(
@@ -235,6 +268,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	var w sync.WaitGroup
 	for _, a := range runningAllocs {
 		w.Add(1)
+		time.Sleep(1 * time.Millisecond)
 		go func(a *api.AllocationListStub) {
 			defer w.Done()
 			alloc, _, err := e.client.Allocations().Info(a.ID, &api.QueryOptions{})
@@ -255,35 +289,41 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			}
 			for taskName, taskStats := range stats.Tasks {
 				ch <- prometheus.MustNewConstMetric(
-					taskCPUPercent, prometheus.GaugeValue, taskStats.ResourceUsage.CpuStats.Percent, alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, taskName, alloc.Job.Region, node.Datacenter, node.Name,
+					taskCPUPercent, prometheus.GaugeValue, taskStats.ResourceUsage.CpuStats.Percent, getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, taskName, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 				)
 				ch <- prometheus.MustNewConstMetric(
-					taskCPUTotalTicks, prometheus.GaugeValue, taskStats.ResourceUsage.CpuStats.TotalTicks, alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, taskName, alloc.Job.Region, node.Datacenter, node.Name,
+					taskCPUTotalTicks, prometheus.GaugeValue, taskStats.ResourceUsage.CpuStats.TotalTicks, getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, taskName, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 				)
 				ch <- prometheus.MustNewConstMetric(
-					taskMemoryRssBytes, prometheus.GaugeValue, float64(taskStats.ResourceUsage.MemoryStats.RSS), alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, taskName, alloc.Job.Region, node.Datacenter, node.Name,
+					taskMemoryRssBytes, prometheus.GaugeValue, float64(taskStats.ResourceUsage.MemoryStats.RSS), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, taskName, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
+				)
+			}
+			for taskName, TaskResources := range alloc.TaskResources {
+				ch <- prometheus.MustNewConstMetric(
+					taskMemoryLimit, prometheus.GaugeValue, float64(getIntPointer(TaskResources.MemoryMB)), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, taskName, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 				)
 			}
 			ch <- prometheus.MustNewConstMetric(
-				allocationCPU, prometheus.GaugeValue, stats.ResourceUsage.CpuStats.Percent, alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, alloc.Job.Region, node.Datacenter, node.Name,
+				allocationCPU, prometheus.GaugeValue, stats.ResourceUsage.CpuStats.Percent, getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 			)
 			ch <- prometheus.MustNewConstMetric(
-				allocationCPUThrottled, prometheus.GaugeValue, float64(stats.ResourceUsage.CpuStats.ThrottledTime), alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, alloc.Job.Region, node.Datacenter, node.Name,
+				allocationCPUThrottled, prometheus.GaugeValue, float64(stats.ResourceUsage.CpuStats.ThrottledTime), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 			)
 			ch <- prometheus.MustNewConstMetric(
-				allocationMemory, prometheus.GaugeValue, float64(stats.ResourceUsage.MemoryStats.RSS), alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, alloc.Job.Region, node.Datacenter, node.Name,
+				allocationMemory, prometheus.GaugeValue, float64(stats.ResourceUsage.MemoryStats.RSS), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 			)
 			ch <- prometheus.MustNewConstMetric(
-				allocationMemoryLimit, prometheus.GaugeValue, float64(alloc.Resources.MemoryMB), alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, alloc.Job.Region, node.Datacenter, node.Name,
+				allocationMemoryLimit, prometheus.GaugeValue, float64(getIntPointer(alloc.Resources.MemoryMB)), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 			)
 			ch <- prometheus.MustNewConstMetric(
-				allocationCPULimit, prometheus.GaugeValue, float64(alloc.Resources.CPU), alloc.Job.Name, alloc.TaskGroup, alloc.Name, alloc.ID, alloc.Job.Region, node.Datacenter, node.Name,
+				allocationCPULimit, prometheus.GaugeValue, float64(getIntPointer(alloc.Resources.CPU)), getStringPointer(alloc.Job.Name), alloc.TaskGroup, alloc.Name, alloc.ID, getStringPointer(alloc.Job.Region), node.Datacenter, node.Name,
 			)
 		}(a)
 	}
 
 	for _, a := range nodes {
 		w.Add(1)
+		time.Sleep(1 * time.Millisecond)
 		go func(a *api.NodeListStub) {
 			defer w.Done()
 			node, _, err := e.client.Nodes().Info(a.ID, &api.QueryOptions{})
@@ -305,15 +345,15 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 				var allocatedCPU, allocatedMemory int
 				for _, alloc := range runningAllocs {
-					allocatedCPU += alloc.Resources.CPU
-					allocatedMemory += alloc.Resources.MemoryMB
+					allocatedCPU += getIntPointer(alloc.Resources.CPU)
+					allocatedMemory += getIntPointer(alloc.Resources.MemoryMB)
 				}
 
 				ch <- prometheus.MustNewConstMetric(
-					nodeResourceMemory, prometheus.GaugeValue, float64(node.Resources.MemoryMB), node.Name, node.Datacenter,
+					nodeResourceMemory, prometheus.GaugeValue, float64(getIntPointer(node.Resources.MemoryMB)), node.Name, node.Datacenter,
 				)
 				ch <- prometheus.MustNewConstMetric(
-					nodeReservedMemory, prometheus.GaugeValue, float64(node.Reserved.MemoryMB), node.Name, node.Datacenter,
+					nodeReservedMemory, prometheus.GaugeValue, float64(getIntPointer(node.Reserved.MemoryMB)), node.Name, node.Datacenter,
 				)
 				ch <- prometheus.MustNewConstMetric(
 					nodeAllocatedMemory, prometheus.GaugeValue, float64(allocatedMemory), node.Name, node.Datacenter,
@@ -322,7 +362,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					nodeUsedMemory, prometheus.GaugeValue, float64(nodeStats.Memory.Used/1024/1024), node.Name, node.Datacenter,
 				)
 				ch <- prometheus.MustNewConstMetric(
-					nodeResourceCPU, prometheus.GaugeValue, float64(node.Resources.CPU), node.Name, node.Datacenter,
+					nodeResourceCPU, prometheus.GaugeValue, float64(getIntPointer(node.Resources.CPU)), node.Name, node.Datacenter,
 				)
 				ch <- prometheus.MustNewConstMetric(
 					nodeAllocatedCPU, prometheus.GaugeValue, float64(allocatedCPU), node.Name, node.Datacenter,
@@ -341,6 +381,9 @@ func getRunningAllocs(client *api.Client, nodeID string) ([]*api.Allocation, err
 
 	// Query the node allocations
 	nodeAllocs, _, err := client.Nodes().Allocations(nodeID, nil)
+	if err != nil {
+		logError(err)
+	}
 	// Filter list to only running allocations
 	for _, alloc := range nodeAllocs {
 		if alloc.ClientStatus == "running" {
@@ -394,7 +437,7 @@ func main() {
 	}
 	prometheus.MustRegister(exporter)
 
-	http.Handle(*metricsPath, prometheus.Handler())
+	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>Nomad Exporter</title></head>
